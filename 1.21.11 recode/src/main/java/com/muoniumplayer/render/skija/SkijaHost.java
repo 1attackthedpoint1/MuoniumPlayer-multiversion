@@ -1,6 +1,13 @@
 package com.muoniumplayer.render.skija;
 
 import com.mojang.blaze3d.opengl.GlStateManager;
+import com.mojang.blaze3d.platform.NativeImage;
+import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.textures.FilterMode;
+import com.mojang.blaze3d.textures.GpuTexture;
+import com.mojang.blaze3d.textures.GpuTextureView;
+import com.mojang.blaze3d.textures.TextureFormat;
 import io.github.humbleui.skija.BackendRenderTarget;
 import io.github.humbleui.skija.Canvas;
 import io.github.humbleui.skija.ColorSpace;
@@ -12,7 +19,12 @@ import io.github.humbleui.skija.ImageInfo;
 import io.github.humbleui.skija.Surface;
 import io.github.humbleui.skija.SurfaceOrigin;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.render.TextureSetup;
+import net.minecraft.client.gui.render.state.BlitRenderState;
+import net.minecraft.client.gui.render.state.GuiRenderState;
+import net.minecraft.client.renderer.RenderPipelines;
 import com.mojang.blaze3d.platform.Window;
+import org.joml.Matrix3x2f;
 
 /**
  * Skia 宿主层：整个渲染层里<b>唯一</b>与 Minecraft 打交道的类。
@@ -157,6 +169,51 @@ public final class SkijaHost {
         return !disabled;
     }
 
+    // ==================== VulkanMod 兼容路径（CPU 光栅 + GUI 纹理合成） ====================
+
+    /** 是否检测过「Minecraft 跑在 VulkanMod 上」。结果钉住，见 {@link #vulkanRenderer()}。 */
+    private static boolean vulkanRendererDecided;
+    private static boolean vulkanRenderer;
+
+    /** 光栅像素落点：Skia 直写这块 NativeImage 内存，帧末原样 writeToTexture。 */
+    private static NativeImage rasterPixels;
+    /** 帧末上传目标：经 MC 的 GpuDevice 抽象创建，由（VulkanMod 实现的）渲染层画上去。 */
+    private static GpuTexture rasterTexture;
+    private static GpuTextureView rasterTextureView;
+    private static boolean firstVulkanCompositeUnlogged = true;
+
+    /**
+     * Minecraft 是否跑在 VulkanMod 上。
+     *
+     * <p>VulkanMod 用自己的 Vulkan 实现整体替换了 {@code GpuDevice}：进程里<b>没有任何
+     * GL 上下文</b>，{@code DirectContext.makeGL()} 拿到的只能是 nullptr（真机第一条
+     * 报错就是 {@code RuntimeException: Can't wrap nullptr}）。这条检测一旦为真，
+     * 整个渲染层改走 CPU 光栅 + 帧末 GUI 纹理合成，全程不碰 GL。
+     *
+     * <p>检测用类存在性而不是加载器 API：共享源码同时喂 Fabric 与 NeoForge，
+     * 不能在这里引 {@code FabricLoader}；而 VulkanMod 是 Fabric-only，类名是它的
+     * 唯一身份。{@code initialize=false} 只探类、不跑静态初始化，把「VulkanMod
+     * 存在但初始化失败」也一并算进来——那种情况下 GL 上下文同样不存在。
+     *
+     * <p>结果钉住一次：Class.forName 本身有同步开销，beginFrame 每帧都来。
+     */
+    public static boolean vulkanRenderer() {
+        if (!vulkanRendererDecided) {
+            vulkanRendererDecided = true;
+            try {
+                Class.forName("net.vulkanmod.vulkan.Renderer", false,
+                        SkijaHost.class.getClassLoader());
+                vulkanRenderer = true;
+            } catch (Throwable t) {
+                vulkanRenderer = false;
+            }
+            if (vulkanRenderer) {
+                log("检测到 VulkanMod（无 GL 上下文），渲染层切换 CPU 光栅 + GUI 纹理合成路径");
+            }
+        }
+        return vulkanRenderer;
+    }
+
     /**
      * 开一帧。成功返回一块已经设置好 GUI 坐标系的 {@link Canvas}，失败返回 null。
      *
@@ -195,6 +252,12 @@ public final class SkijaHost {
             if (!SkijaNatives.ensureLoaded()) {
                 fail("Skija 原生库不可用: " + SkijaNatives.failure(), null);
                 return null;
+            }
+            // VulkanMod 下没有 GL 上下文，DirectContext.makeGL() 必然拿 nullptr。
+            // 光栅化本身不需要 GPU：Skia 的 CPU 后端在同一个原生库里， natives 检查已过，
+            // 从这里拐进光栅路径。合成见 compositeFrameVulkan。
+            if (vulkanRenderer()) {
+                return beginFrameRaster(guiWidth, guiHeight, pixelWidth, pixelHeight);
             }
             if (context == null) {
                 try {
@@ -330,6 +393,88 @@ public final class SkijaHost {
             frameCleared = true;
         }
         return c;
+    }
+
+    // ==================== VulkanMod 路径：CPU 光栅帧 ====================
+
+    /**
+     * VulkanMod 路径的 beginFrame：与 GL 路径完全同构（同一个 {@code offscreen} 字段、
+     * 同一套清屏/save/scale 规则），差别只有三处：
+     * <ol>
+     *   <li>离屏目标是 CPU 光栅 {@link Surface}（直接包着 {@link NativeImage} 的内存），
+     *       不建 FBO、不做 GL 快照、不动像素解包布局——没有 GL 可动；</li>
+     *   <li>绘制在 canvas 调用那一刻就已落盘，endFrame 没有 GPU 活可提交；</li>
+     *   <li>合成交给 {@link #compositeFrameVulkan}，在 {@code GuiRenderer#render} 入口
+     *       把像素当 GUI 纹理提交回 MC 的渲染抽象层。</li>
+     * </ol>
+     */
+    private static Canvas beginFrameRaster(int guiWidth, int guiHeight,
+                                           int pixelWidth, int pixelHeight) {
+        if (offscreen == null || offscreenWidth != pixelWidth || offscreenHeight != pixelHeight) {
+            // 先关 Surface 再关像素缓冲：Surface 还引用着旧 NativeImage 的内存，顺序反了
+            // 是给析构器递一块 free 过的指针。
+            closeOffscreen();
+            closeRasterPixels();
+            offscreen = createRasterTarget(pixelWidth, pixelHeight);
+            if (offscreen == null) {
+                return null;
+            }
+            offscreenWidth = pixelWidth;
+            offscreenHeight = pixelHeight;
+        }
+        frameGuiWidth = guiWidth;
+        frameGuiHeight = guiHeight;
+        frameGuiScale = (double) pixelWidth / (double) guiWidth;
+        canvas = offscreen.getCanvas();
+        if (!frameCleared) {
+            // CPU 光栅的 clear 就是逐行 memset，不存在「驱动 clear 优化不生效」的坑，
+            // 也不需要自持 FBO 那套裸 GL 清屏。清屏语义与 GL 路径一致：一帧多次
+            // begin/end 只清第一次，内容跨对累积。
+            canvas.clear(0x00000000);
+            frameCleared = true;
+        }
+        canvas.save();
+        float scale = (float) pixelWidth / (float) guiWidth;
+        canvas.scale(scale, scale);
+        inFrame = true;
+        SkijaGfx.beginFrame();
+        SkijaClip.resetFrame();
+        return canvas;
+    }
+
+    /**
+     * 建光栅目标：{@link Surface#makeRasterDirect} 把 {@link NativeImage} 的 STB 内存
+     * 直接包成 Skia 光栅面。Skia 的 CPU 光栅化逐笔画进这块内存，帧末
+     * {@code writeToTexture} 一步进 GPU，中间没有任何整帧像素拷贝。
+     *
+     * <p>字节序对账：Skia 的 N32 是 kRGBA_8888，内存排列 R,G,B,A、行主序；
+     * {@code NativeImage.Format.RGBA}（STB 约定）同为 R,G,B,A。预乘 alpha
+     * （N32Premul）与 GUI 管线 {@code GUI_TEXTURED_PREMULTIPLIED_ALPHA} 正好对口，
+     * 不需要任何格式转换。
+     */
+    private static Surface createRasterTarget(int pixelWidth, int pixelHeight) {
+        try {
+            rasterPixels = new NativeImage(NativeImage.Format.RGBA, pixelWidth, pixelHeight, false);
+            Surface s = Surface.makeRasterDirect(
+                    ImageInfo.makeN32Premul(pixelWidth, pixelHeight),
+                    rasterPixels.getPointer(), (long) pixelWidth * 4L);
+            if (s == null) {
+                fail("Surface.makeRasterDirect 返回 null（" + pixelWidth + "x" + pixelHeight + "）", null);
+                return null;
+            }
+            log("离屏目标（CPU 光栅直写）已建立 " + pixelWidth + "x" + pixelHeight);
+            return s;
+        } catch (Throwable t) {
+            fail("CPU 光栅目标建立失败", t);
+            return null;
+        }
+    }
+
+    private static void closeRasterPixels() {
+        if (rasterPixels != null) {
+            rasterPixels.close();
+            rasterPixels = null;
+        }
     }
 
     /**
@@ -493,7 +638,11 @@ public final class SkijaHost {
             SkijaGfx.endFrame();
             SkijaClip.resetFrame();
             canvas.restore();
-            if (DEBUG_DRAW_DIRECT) {
+            if (vulkanRenderer()) {
+                // CPU 光栅在 canvas 调用那一刻就已落进 NativeImage 内存，没有 GPU 活可提交；
+                // 只把「帧末有待合成内容」立起来，等 GuiRenderer#render 入口来收。
+                pendingComposite = true;
+            } else if (DEBUG_DRAW_DIRECT) {
                 // 直连模式没有离屏图，本来就是即时画到 MC 的 FBO 上，只需要提交。
                 context.flushAndSubmit(directSurface);
             } else {
@@ -506,7 +655,11 @@ public final class SkijaHost {
         } finally {
             canvas = null;
             closeDirect();
-            restoreMinecraftState();
+            if (!vulkanRenderer()) {
+                // Vulkan 路径从头到尾没碰过 GL 状态，没有「还给 Minecraft」一说；
+                // 这里做 GL 调用反而会在没有上下文的进程里直接抛异常。
+                restoreMinecraftState();
+            }
         }
     }
 
@@ -605,9 +758,153 @@ public final class SkijaHost {
 
     /** Defer an overlay until the base GUI has reached the window framebuffer. */
     public static boolean deferPostCompositeOverlay(Runnable overlay) {
-        if (overlay == null || disabled || DEBUG_DRAW_DIRECT || context == null || offscreen == null) return false;
+        if (overlay == null || disabled || DEBUG_DRAW_DIRECT || offscreen == null) return false;
+        // Vulkan 路径没有 DirectContext，判据换掉：光栅目标立得起来就能 defer，
+        // 收口在 compositeFrameVulkan（同样画在主层之上的独立 stratum）。
+        if (!vulkanRenderer() && context == null) return false;
         postCompositeOverlay = overlay;
         return true;
+    }
+
+    // ==================== VulkanMod 路径：帧末合成 ====================
+
+    /**
+     * VulkanMod 路径的帧末合成：把 CPU 光栅攒好的离屏图作为<b>最上层 GUI 纹理</b>提交回
+     * {@link GuiRenderState}，由 Minecraft 的 {@code GuiRenderer}（VulkanMod 下是它的
+     * Vulkan 实现）在同一帧里画上去。
+     *
+     * <p>由 {@code GuiRendererMixin} 挂在 {@code GuiRenderer#render} 的入口调用。选这里
+     * 而不是别处，三条理由：
+     * <ol>
+     *   <li><b>收集已收口</b>：本渲染层的调用点全在 GUI「收集」阶段；{@code render}
+     *       入口意味着所有原版 GUI 元素都已入列、遍历还没开始——此刻
+     *       {@code nextStratum()} 追加的层必然是 strata 列表末尾，按入列顺序绘制，
+     *       画在所有 GUI（含模糊之后的内容）之上，与 GL 路径「盖在窗口默认帧缓冲
+     *       最上面」的层级观感一致。元素排序比较器只作用于每个 stratum 内部的
+     *       元素列表，单元素层没有重排风险。</li>
+     *   <li><b>不碰任何 GL</b>：上传走 {@code CommandEncoder#writeToTexture}，绘制走
+     *       原版 {@code RenderPipelines#GUI_TEXTURED_PREMULTIPLIED_ALPHA}——全部是
+     *       Minecraft 的渲染抽象层 API。VulkanMod 恰好就是靠实现这一层接管渲染的，
+     *       它自己的 GuiRendererMixin（物品图集 blit）走的也是同一条
+     *       {@code TextureSetup.singleTexture} 构造路径。</li>
+     *   <li><b>blitToScreen 在 VulkanMod 下不存在</b>：VulkanMod 的 MinecraftMixin
+     *       {@code @Redirect} 掉了 {@code RenderTarget#blitToScreen()}，GL 路径的
+     *       {@code FramebufferMixin} 在此环境下永远不会触发，两路互不串线。</li>
+     * </ol>
+     *
+     * <p>与 GL 路径的 compositeFrame 一样，无论本帧有没有内容都必须被调到：
+     * 它负责复位「本帧已清屏」标志，否则下一帧会在旧内容上继续画。
+     */
+    public static void compositeFrameVulkan(GuiRenderState renderState) {
+        if (!vulkanRenderer()) {
+            // GL 后端：合成由 FramebufferMixin → compositeFrame 负责，这里什么都不做。
+            return;
+        }
+        Runnable topOverlay = postCompositeOverlay;
+        postCompositeOverlay = null;
+        boolean hadContent = pendingComposite;
+        pendingComposite = false;
+        frameCleared = false;
+        if (disabled || offscreen == null || renderState == null) {
+            return;
+        }
+        if (inFrame) {
+            fail("compositeFrameVulkan 时仍在帧内，跳过本帧合成", null);
+            return;
+        }
+        if (hadContent) {
+            try {
+                submitOverlayStratum(renderState, frameGuiWidth, frameGuiHeight);
+                if (firstVulkanCompositeUnlogged) {
+                    firstVulkanCompositeUnlogged = false;
+                    log("首次 Vulkan 路径合成完成 " + offscreenWidth + "x" + offscreenHeight
+                            + " → GUI 纹理层（" + frameGuiWidth + "x" + frameGuiHeight + "）");
+                }
+            } catch (Throwable t) {
+                fail("compositeFrameVulkan 失败", t);
+            }
+        }
+        if (disabled) {
+            return;
+        }
+        // 顶层灵动岛：Vulkan 路径没有窗口帧缓冲可回采（glReadPixels 不存在），
+        // 玻璃折射自动退化为无折射底纹（GlassBackdrop 在 context()==null 时整条跳过），
+        // 但层级语义保持一致——岛单独再提交一个 stratum，画在主层之上。
+        if (topOverlay != null) {
+            if (beginFrame() != null) {
+                try {
+                    topOverlay.run();
+                } catch (Throwable failure) {
+                    if (!postCompositeOverlayFailureLogged) {
+                        postCompositeOverlayFailureLogged = true;
+                        log("顶层灵动岛绘制失败，本帧已跳过: " + failure);
+                    }
+                } finally {
+                    endFrame();
+                }
+                if (pendingComposite && !disabled) {
+                    pendingComposite = false;
+                    try {
+                        submitOverlayStratum(renderState, frameGuiWidth, frameGuiHeight);
+                    } catch (Throwable failure) {
+                        fail("顶层灵动岛合成失败（Vulkan 路径）", failure);
+                    }
+                }
+            }
+            frameCleared = false;
+            pendingComposite = false;
+        }
+    }
+
+    /**
+     * 把离屏像素整张上传并提交成一个整屏 GUI blit 元素。
+     * 上传与提交都必须在渲染线程上做（GuiRenderer#render 本来就在）。
+     */
+    private static void submitOverlayStratum(GuiRenderState renderState, int guiWidth, int guiHeight) {
+        if (guiWidth <= 0 || guiHeight <= 0 || rasterPixels == null) {
+            return;
+        }
+        ensureRasterUploadTarget();
+        // NativeImage 与离屏像素是同一块内存：这里没有任何拷贝，只有一次纹理传输。
+        RenderSystem.getDevice().createCommandEncoder().writeToTexture(rasterTexture, rasterPixels);
+        // 新开 stratum（绘制顺序 = strata 入列顺序）→ 整屏 blit 盖在所有 GUI 之上。
+        // pose 用单位阵：提交的就是 GUI 坐标，坐标换算由 GUI 管线的投影完成；
+        // uv 0..1 整张纹理；color=-1（白）不再染色。
+        renderState.nextStratum();
+        renderState.submitBlitToCurrentLayer(new BlitRenderState(
+                RenderPipelines.GUI_TEXTURED_PREMULTIPLIED_ALPHA,
+                TextureSetup.singleTexture(rasterTextureView,
+                        RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR)),
+                new Matrix3x2f(),
+                0, 0, guiWidth, guiHeight,
+                0f, 1f, 0f, 1f,
+                -1, null));
+    }
+
+    /** 上传纹理与离屏图同尺寸，跟着窗口重建；usage 与原版 DynamicTexture 同款。 */
+    private static void ensureRasterUploadTarget() {
+        if (rasterTexture != null
+                && rasterTexture.getWidth(0) == offscreenWidth
+                && rasterTexture.getHeight(0) == offscreenHeight) {
+            return;
+        }
+        closeRasterUploadTarget();
+        GpuDevice device = RenderSystem.getDevice();
+        rasterTexture = device.createTexture("muonium-overlay",
+                GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_COPY_DST,
+                TextureFormat.RGBA8, offscreenWidth, offscreenHeight, 1, 1);
+        rasterTextureView = device.createTextureView(rasterTexture);
+    }
+
+    private static void closeRasterUploadTarget() {
+        if (rasterTextureView != null) {
+            rasterTextureView.close();
+            rasterTextureView = null;
+        }
+        if (rasterTexture != null) {
+            rasterTexture.close();
+            rasterTexture = null;
+        }
     }
 
     private static void renderPostCompositeOverlay(Runnable overlay) {
@@ -1139,6 +1436,10 @@ public final class SkijaHost {
         SkijaImages.clear();
         closeDirect();
         closeOffscreen();
+        // Vulkan 路径的家当：光栅像素缓冲跟离屏 Surface 同生共死（Surface 先关，理由见
+        // beginFrameRaster 的注释），上传纹理/view 走 GpuDevice 自己的引用计数。
+        closeRasterPixels();
+        closeRasterUploadTarget();
         if (context != null) {
             context.close();
             context = null;

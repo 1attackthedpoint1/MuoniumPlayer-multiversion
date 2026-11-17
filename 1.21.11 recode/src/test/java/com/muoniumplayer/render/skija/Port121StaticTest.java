@@ -72,14 +72,43 @@ class Port121StaticTest {
             String text = read(config);
             assertTrue(text.contains("\"FramebufferMixin\""),
                     config + " 的 client 数组里没有 FramebufferMixin，mixin 根本不会被加载");
-            assertFalse(text.contains("GuiRendererMixin"),
-                    "GuiRendererMixin 是已被证伪的旧方案（贴到默认帧缓冲后会被 blitToScreen 覆盖），"
-                            + "不允许再注册：" + config);
         }
+
+        // VulkanMod 兼容路径（2026-11 新增）：VulkanMod 没有 GL 上下文，blitToScreen 被
+        // 它 @Redirect 掉，GL 路径整条不触发。合成改走「GuiRenderer#render 入口 + GUI
+        // 纹理 stratum」——与已被证伪的旧 GuiRendererMixin（TAIL 直写默认帧缓冲）不同，
+        // 新路径不碰任何帧缓冲、不做任何 GL 调用，只在 VulkanMod 存在时激活。
+        String vulkanMixin = read(ProjectPaths.sourceFile(
+                Paths.get("com", "muoniumplayer", "mixin", "GuiRendererMixin.java")));
+        assertTrue(vulkanMixin.contains("SkijaHost.compositeFrameVulkan"),
+                "GuiRendererMixin 必须把 GuiRenderState 递给 SkijaHost.compositeFrameVulkan");
+        assertTrue(vulkanMixin.contains("@At(\"HEAD\")"),
+                "Vulkan 路径必须挂 render 入口：所有 GUI 元素已入列、遍历未开始，"
+                        + "此刻 nextStratum 追加的层必然画在最上面");
+        assertFalse(vulkanMixin.contains("org.lwjgl") || vulkanMixin.contains("GlStateManager"),
+                "Vulkan 路径的 mixin 不许出现任何 GL 调用：该环境下没有 GL 上下文，"
+                        + "直写帧缓冲正是旧方案被证伪的原因");
+
+        String fabricMixinConfig = read(MIXIN_CONFIG);
+        assertTrue(fabricMixinConfig.contains("\"GuiRendererMixin\"")
+                        && fabricMixinConfig.contains("\"GuiRendererAccessor\""),
+                "Fabric 的 mixins.json 必须注册 Vulkan 路径的两个 mixin（VulkanMod 是 "
+                        + "Fabric-only，NeoForge 侧无需也不应注册）");
+        String neoforgeMixinConfig = read(NEOFORGE_MIXIN_CONFIG);
+        assertFalse(neoforgeMixinConfig.contains("GuiRendererMixin"),
+                "VulkanMod 没有 NeoForge 版，NeoForge 的 mixins.json 不应注册 Vulkan 路径");
 
         String host = read(SKIJA_HOST);
         assertTrue(host.contains("public static void compositeFrame()"),
                 "SkijaHost.compositeFrame 是 mixin 的唯一入口，签名不能动");
+        assertTrue(host.contains("public static void compositeFrameVulkan(GuiRenderState"),
+                "Vulkan 路径的合成入口不能动；GuiRendererMixin 依赖这个签名");
+        int vulkanGate = host.indexOf("public static void compositeFrameVulkan(GuiRenderState");
+        int gateEnd = host.indexOf("nextStratum", vulkanGate);
+        assertTrue(gateEnd > vulkanGate
+                        && host.substring(vulkanGate, gateEnd).contains("!vulkanRenderer()"),
+                "compositeFrameVulkan 必须先过 vulkanRenderer() 闸：GL 后端下 blitToScreen "
+                        + "路径负责合成，两条路径不能串线");
     }
 
     @Test

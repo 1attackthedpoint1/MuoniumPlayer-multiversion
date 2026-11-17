@@ -8,6 +8,8 @@
     "MusicManagerAccessor",
     "MusicManagerDuckMixin",
     "FramebufferMixin",
+    "GuiRendererAccessor",
+    "GuiRendererMixin",
     "WorldLyricsRenderTailMixin",
     "TransparentEntityMixin",
     "TransparentCameraMixin",

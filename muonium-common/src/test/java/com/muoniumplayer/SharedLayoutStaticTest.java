@@ -98,6 +98,10 @@ class SharedLayoutStaticTest {
             //     七树各一份；本表只登记"存在即可"，不要求每棵树都有 ---
             "com/muoniumplayer/core/screens/MuoniumConfigNotice.java",
             "com/muoniumplayer/mixin/FramebufferMixin.java",
+            // --- VulkanMod 兼容：GuiRenderer#render 入口 + GUI 纹理 stratum 合成，
+            //     依赖 1.21.11 的 GpuDevice/GuiRenderState 抽象层形态（仅 1.21.11）---
+            "com/muoniumplayer/mixin/GuiRendererMixin.java",
+            "com/muoniumplayer/mixin/GuiRendererAccessor.java",
             "com/muoniumplayer/mixin/GlSurfaceMixin.java",
             "com/muoniumplayer/mixin/RenderTargetPresentMixin.java",
             "com/muoniumplayer/mixin/MouseScrollMixin.java",
