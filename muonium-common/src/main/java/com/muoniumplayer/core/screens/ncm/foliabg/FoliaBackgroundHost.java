@@ -52,6 +52,10 @@ public final class FoliaBackgroundHost {
 
     private final FoliaAudioFrame audio = new FoliaAudioFrame();
     private final FoliaCommonBackground commonBackground = new FoliaCommonBackground();
+    /** LATENT 的 ¼ 分辨率离屏缓存（仅 VulkanMod / CPU 光栅档启用，见 {@link VulkanBgCache}）。 */
+    private final VulkanBgCache latentCache = new VulkanBgCache();
+    /** NOMAND 的同款缓存。 */
+    private final VulkanBgCache nomandCache = new VulkanBgCache();
 
 
     /** 动画时钟：与音频解耦，暂停/静音时仍以基速漂移（参考实现的行为）。 */
@@ -87,6 +91,9 @@ public final class FoliaBackgroundHost {
     public void dispose() {
         releaseCover();
         releaseStatic();
+        latentCache.close();
+        nomandCache.close();
+        commonBackground.dispose();
         audio.reset();
     }
 
@@ -272,17 +279,47 @@ public final class FoliaBackgroundHost {
         boolean showMesh = displayMode != 0;
         boolean showDither = displayMode != 1;
 
-        if (showMesh) {
-            drawLatentLayer(canvas, width, height, alpha, effect, 0f, mesh, distortion, swirl,
-                    meshSaturation, meshBrightness, meshScale, ditherBack, ditherFront,
-                    ditherSize, 1f, ditherScale);
+        // VulkanMod（CPU 光栅）档：mesh + 抖动两层是整屏 SkSL，逐像素跑在 CPU 上
+        // 就是每帧几十上百毫秒。改画进 ¼ 分辨率离屏缓存、每 150ms 重算一次
+        // （见 VulkanBgCache 的类注释），层序与混合语义保持一致。
+        Canvas paintTarget = canvas;
+        float targetW = width;
+        float targetH = height;
+        float layerGlobalAlpha = alpha;
+        boolean cached = latentCache.enabled();
+        boolean renderLayers = true;
+        if (cached) {
+            Canvas offscreen = latentCache.begin(width, height);
+            if (offscreen != null) {
+                paintTarget = offscreen;
+                targetW = latentCache.width();
+                targetH = latentCache.height();
+                layerGlobalAlpha = 1f;
+                // 抖动层的 SOFT_LIGHT 必须打在底色上（对透明底结果不同），
+                // 离屏里先垫同一层底色，整层语义才与逐层直画等价。
+                fill(paintTarget, targetW, targetH, backgroundColor, 1f);
+            } else {
+                renderLayers = false;
+                latentCache.composite(canvas, width, height, alpha);
+            }
         }
-        if (showDither) {
-            // 只有抖动层时它是不透明底（上游的 mixBlendMode: normal + opacity 1）。
-            float layerAlpha = showMesh ? ditherOpacity : 1f;
-            drawLatentLayer(canvas, width, height, alpha, effect, 1f, mesh, distortion, swirl,
-                    meshSaturation, meshBrightness, meshScale, ditherBack, ditherFront,
-                    ditherSize, layerAlpha, ditherScale);
+
+        if (renderLayers) {
+            if (showMesh) {
+                drawLatentLayer(paintTarget, targetW, targetH, layerGlobalAlpha, effect, 0f, mesh, distortion, swirl,
+                        meshSaturation, meshBrightness, meshScale, ditherBack, ditherFront,
+                        ditherSize, 1f, ditherScale);
+            }
+            if (showDither) {
+                // 只有抖动层时它是不透明底（上游的 mixBlendMode: normal + opacity 1）。
+                float layerAlpha = showMesh ? ditherOpacity : 1f;
+                drawLatentLayer(paintTarget, targetW, targetH, layerGlobalAlpha, effect, 1f, mesh, distortion, swirl,
+                        meshSaturation, meshBrightness, meshScale, ditherBack, ditherFront,
+                        ditherSize, layerAlpha, ditherScale);
+            }
+            if (cached) {
+                latentCache.end(canvas, width, height, alpha);
+            }
         }
 
         if (FoliaBackgroundConfig.latentOverlayEnabled
@@ -365,9 +402,30 @@ public final class FoliaBackgroundHost {
         }
 
         Shader shaded = null;
-        try (RuntimeEffectBuilder builder = new RuntimeEffectBuilder(effect)) {
-            builder.setUniform("resolution", width, height);
-            builder.setUniform("alpha", alpha);
+        // VulkanMod（CPU 光栅）档：整屏 SkSL 走 ¼ 分辨率离屏缓存（同 LATENT，见 VulkanBgCache）。
+        Canvas paintTarget = canvas;
+        float targetW = width;
+        float targetH = height;
+        float layerGlobalAlpha = alpha;
+        boolean cached = nomandCache.enabled();
+        boolean renderShader = true;
+        if (cached) {
+            Canvas offscreen = nomandCache.begin(width, height);
+            if (offscreen != null) {
+                paintTarget = offscreen;
+                targetW = nomandCache.width();
+                targetH = nomandCache.height();
+                layerGlobalAlpha = 1f;
+                fill(paintTarget, targetW, targetH, back, 1f);
+            } else {
+                renderShader = false;
+                nomandCache.composite(canvas, width, height, alpha);
+            }
+        }
+        if (renderShader) {
+            try (RuntimeEffectBuilder builder = new RuntimeEffectBuilder(effect)) {
+                builder.setUniform("resolution", targetW, targetH);
+                builder.setUniform("alpha", layerGlobalAlpha);
             builder.setUniform("effect", (float) effectIndex);
             builder.setUniform("inverted", inverted ? 1f : 0f);
             builder.setUniform("originalColors",
@@ -397,12 +455,16 @@ public final class FoliaBackgroundHost {
             shaded = builder.makeShader();
             try (Paint paint = new Paint()) {
                 paint.setShader(shaded);
-                canvas.drawRect(Rect.makeXYWH(0f, 0f, width, height), paint);
+                paintTarget.drawRect(Rect.makeXYWH(0f, 0f, targetW, targetH), paint);
             }
         } catch (Throwable failure) {
             System.out.println("[MuoniumPlayer/FoliaBg] Nomand 绘制失败: " + failure);
         } finally {
             if (shaded != null) shaded.close();
+        }
+        if (cached) {
+            nomandCache.end(canvas, width, height, alpha);
+        }
         }
 
         if (FoliaBackgroundConfig.nomandOverlayEnabled

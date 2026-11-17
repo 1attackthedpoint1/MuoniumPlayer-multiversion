@@ -123,6 +123,9 @@ public final class FoliaCommonBackground {
         float delay;
     }
 
+    /** 流体层的 ¼ 分辨率离屏缓存（仅 VulkanMod / CPU 光栅档启用，见 {@link VulkanBgCache}）。 */
+    private final VulkanBgCache fluidCache = new VulkanBgCache();
+
     /** 默认布局（固定 {@link #DEFAULT_SEED}）。 */
     public FoliaCommonBackground() {
         this(DEFAULT_SEED);
@@ -135,6 +138,11 @@ public final class FoliaCommonBackground {
      */
     public FoliaCommonBackground(long seed) {
         generate(seed);
+    }
+
+    /** 释放 Vulkan 光栅档的流体层缓存（见 {@link VulkanBgCache}）；GL 后端下是 no-op。 */
+    public void dispose() {
+        fluidCache.close();
     }
 
     /** 按参考实现的抽取顺序生成两套布局（见类注释「随机数的差异」）。 */
@@ -236,30 +244,54 @@ public final class FoliaCommonBackground {
                            Shader coverShader) {
         RuntimeEffect effect = FoliaSkSL.effect(FoliaSkSL.FLUID);
         if (effect == null) return;
-        Shader shaded = null;
-        try (RuntimeEffectBuilder builder = new RuntimeEffectBuilder(effect)) {
-            builder.setUniform("resolution", width, height);
-            builder.setUniform("alpha", 1f);
-            builder.setUniform("blurPx", COVER_BLUR_PX);
-            builder.setUniform("gradientOpacity", COVER_GRADIENT_OPACITY);
-            builder.setUniform("primaryColor",
-                    FoliaTheme.r(theme.primary), FoliaTheme.g(theme.primary), FoliaTheme.b(theme.primary));
-            builder.setUniform("secondaryColor",
-                    FoliaTheme.r(theme.secondary), FoliaTheme.g(theme.secondary), FoliaTheme.b(theme.secondary));
-            builder.setUniform("backgroundColor",
-                    FoliaTheme.r(theme.background), FoliaTheme.g(theme.background), FoliaTheme.b(theme.background));
-            builder.setUniform("hasCover", 1f);
-            builder.setUniform("coverScale", COVER_SCALE);
-            builder.setChild("cover", coverShader);
-            shaded = builder.makeShader();
-            try (Paint paint = new Paint()) {
-                paint.setShader(shaded);
-                canvas.drawRect(Rect.makeXYWH(0f, 0f, width, height), paint);
+        // VulkanMod（CPU 光栅）档：整屏 SkSL 走 ¼ 分辨率离屏缓存（见 VulkanBgCache）。
+        // 流体层的 uniform 只有封面与主题色、没有时钟，缓存命中率高，150ms 的
+        // 刷新间隔只是为了在封面/主题色变化时自动收敛。
+        Canvas paintTarget = canvas;
+        float targetW = width;
+        float targetH = height;
+        boolean cached = fluidCache.enabled();
+        boolean renderShader = true;
+        if (cached) {
+            Canvas offscreen = fluidCache.begin(width, height);
+            if (offscreen != null) {
+                paintTarget = offscreen;
+                targetW = fluidCache.width();
+                targetH = fluidCache.height();
+            } else {
+                renderShader = false;
+                fluidCache.composite(canvas, width, height, 1f);
             }
-        } catch (Throwable failure) {
-            System.out.println("[MuoniumPlayer/FoliaBg] Common 流体绘制失败: " + failure);
-        } finally {
-            if (shaded != null) shaded.close();
+        }
+        if (renderShader) {
+            Shader shaded = null;
+            try (RuntimeEffectBuilder builder = new RuntimeEffectBuilder(effect)) {
+                builder.setUniform("resolution", targetW, targetH);
+                builder.setUniform("alpha", 1f);
+                builder.setUniform("blurPx", COVER_BLUR_PX);
+                builder.setUniform("gradientOpacity", COVER_GRADIENT_OPACITY);
+                builder.setUniform("primaryColor",
+                        FoliaTheme.r(theme.primary), FoliaTheme.g(theme.primary), FoliaTheme.b(theme.primary));
+                builder.setUniform("secondaryColor",
+                        FoliaTheme.r(theme.secondary), FoliaTheme.g(theme.secondary), FoliaTheme.b(theme.secondary));
+                builder.setUniform("backgroundColor",
+                        FoliaTheme.r(theme.background), FoliaTheme.g(theme.background), FoliaTheme.b(theme.background));
+                builder.setUniform("hasCover", 1f);
+                builder.setUniform("coverScale", COVER_SCALE);
+                builder.setChild("cover", coverShader);
+                shaded = builder.makeShader();
+                try (Paint paint = new Paint()) {
+                    paint.setShader(shaded);
+                    paintTarget.drawRect(Rect.makeXYWH(0f, 0f, targetW, targetH), paint);
+                }
+            } catch (Throwable failure) {
+                System.out.println("[MuoniumPlayer/FoliaBg] Common 流体绘制失败: " + failure);
+            } finally {
+                if (shaded != null) shaded.close();
+            }
+            if (cached) {
+                fluidCache.end(canvas, width, height, 1f);
+            }
         }
     }
 
