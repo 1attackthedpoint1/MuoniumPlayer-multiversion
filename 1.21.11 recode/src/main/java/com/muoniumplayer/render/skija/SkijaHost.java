@@ -175,6 +175,34 @@ public final class SkijaHost {
     private static boolean vulkanRendererDecided;
     private static boolean vulkanRenderer;
 
+    /**
+     * Vulkan 光栅档的离屏分辨率系数（相对窗口像素尺寸）。
+     *
+     * <p>整窗 CPU 光栅 + 每帧全量上传在 2560x1600 上实测把游戏帧数拖进个位数：
+     * GUI 缩放 4 时逻辑分辨率只有 640x400，全分辨率光栅是 16 倍的过度采样。
+     * 默认 0.5（像素量 1/4）仍有 2 倍逻辑分辨率，文本清晰度无损观感；
+     * 追求极致画质可用 {@code -Dmuonium.skija.vulkanScale=1.0} 还原。
+     */
+    private static final double VULKAN_RASTER_SCALE = vulkanRasterScale();
+
+    private static double vulkanRasterScale() {
+        try {
+            return Math.min(1.0, Math.max(0.25,
+                    Double.parseDouble(System.getProperty("muonium.skija.vulkanScale", "0.5"))));
+        } catch (Throwable t) {
+            return 0.5;
+        }
+    }
+
+    /**
+     * 诊断闸：{@code -Dmuonium.skija.vulkanDisable=true} 彻底停用 Vulkan 光栅路径
+     * （效果等同旧版「渲染层停用」，UI 不画但游戏本体不受影响）。
+     * 用于二分「帧数低是本渲染层还是 VulkanMod×光影组合本身」：
+     * 开着这个参数帧数仍然低，问题就不在 MuoniumPlayer。
+     */
+    private static final boolean VULKAN_RASTER_DISABLED =
+            Boolean.getBoolean("muonium.skija.vulkanDisable");
+
     /** 光栅像素落点：Skia 直写这块 NativeImage 内存，帧末原样 writeToTexture。 */
     private static NativeImage rasterPixels;
     /** 帧末上传目标：经 MC 的 GpuDevice 抽象创建，由（VulkanMod 实现的）渲染层画上去。 */
@@ -406,21 +434,29 @@ public final class SkijaHost {
      */
     private static Canvas beginFrameRaster(int guiWidth, int guiHeight,
                                            int pixelWidth, int pixelHeight) {
-        if (offscreen == null || offscreenWidth != pixelWidth || offscreenHeight != pixelHeight) {
+        if (VULKAN_RASTER_DISABLED) {
+            // 诊断闸开着：这帧不画（见该常量的注释），上层按「渲染层不可用」处理。
+            return null;
+        }
+        // 离屏按系数降采样：全分辨率光栅对 GUI 缩放 4 的界面是 16 倍过度采样，
+        // CPU 光栅 + 每帧全量上传的量能直接把游戏帧数拖垮（实机教训）。
+        int targetWidth = Math.max(1, Math.round((float) (pixelWidth * VULKAN_RASTER_SCALE)));
+        int targetHeight = Math.max(1, Math.round((float) (pixelHeight * VULKAN_RASTER_SCALE)));
+        if (offscreen == null || offscreenWidth != targetWidth || offscreenHeight != targetHeight) {
             // 先关 Surface 再关像素缓冲：Surface 还引用着旧 NativeImage 的内存，顺序反了
             // 是给析构器递一块 free 过的指针。
             closeOffscreen();
             closeRasterPixels();
-            offscreen = createRasterTarget(pixelWidth, pixelHeight);
+            offscreen = createRasterTarget(targetWidth, targetHeight);
             if (offscreen == null) {
                 return null;
             }
-            offscreenWidth = pixelWidth;
-            offscreenHeight = pixelHeight;
+            offscreenWidth = targetWidth;
+            offscreenHeight = targetHeight;
         }
         frameGuiWidth = guiWidth;
         frameGuiHeight = guiHeight;
-        frameGuiScale = (double) pixelWidth / (double) guiWidth;
+        frameGuiScale = (double) targetWidth / (double) guiWidth;
         canvas = offscreen.getCanvas();
         if (!frameCleared) {
             // CPU 光栅的 clear 就是逐行 memset，不存在「驱动 clear 优化不生效」的坑，
@@ -430,7 +466,7 @@ public final class SkijaHost {
             frameCleared = true;
         }
         canvas.save();
-        float scale = (float) pixelWidth / (float) guiWidth;
+        float scale = (float) offscreenWidth / (float) guiWidth;
         canvas.scale(scale, scale);
         inFrame = true;
         SkijaGfx.beginFrame();
@@ -470,6 +506,11 @@ public final class SkijaHost {
         if (rasterPixels != null) {
             rasterPixels.close();
             rasterPixels = null;
+        }
+        if (rasterShadow != null) {
+            org.lwjgl.system.MemoryUtil.memFree(rasterShadow);
+            rasterShadow = null;
+            lastUploadEmpty = true;
         }
     }
 
@@ -853,19 +894,91 @@ public final class SkijaHost {
     }
 
     /**
+     * 上一次上传的像素镜像（与离屏同尺寸的本地缓冲）。帧末与离屏逐字比对：
+     * 完全一致就跳过上传——静态界面（暂停的歌词、停住的 HUD）不再每帧背 4~16MB
+     * 的 memcpy + staging 传输，只补一张引用既有纹理的 blit（一张四边形，忽略不计）。
+     */
+    private static java.nio.LongBuffer rasterShadow;
+    /** 上一次上传的内容是否为全空（全透明）。空帧连 blit 都不用提交。 */
+    private static boolean lastUploadEmpty = true;
+
+    /**
      * 把离屏像素整张上传并提交成一个整屏 GUI blit 元素。
      * 上传与提交都必须在渲染线程上做（GuiRenderer#render 本来就在）。
+     *
+     * <p>静态帧优化：先与 {@link #rasterShadow} 逐字比对（1/2 分辨率下 ~0.5ms），
+     * 没变就只提交 blit；整帧全透明就连 blit 一起省——游戏里 HUD 没内容时
+     * 本渲染层的每帧开销只剩一次降采样光栅的 clear。
      */
     private static void submitOverlayStratum(GuiRenderState renderState, int guiWidth, int guiHeight) {
         if (guiWidth <= 0 || guiHeight <= 0 || rasterPixels == null) {
             return;
         }
+        long pixelsPtr = rasterPixels.getPointer();
+        int bytes = rasterPixels.getWidth() * rasterPixels.getHeight() * 4;
+        int words = bytes >>> 3;
+        int tail = bytes & 7;
+        if (rasterShadow == null || rasterShadow.capacity() < words) {
+            if (rasterShadow != null) {
+                org.lwjgl.system.MemoryUtil.memFree(rasterShadow);
+            }
+            rasterShadow = org.lwjgl.system.MemoryUtil.memAllocLong(Math.max(1, words));
+            lastUploadEmpty = true;
+        }
+        java.nio.LongBuffer current = org.lwjgl.system.MemoryUtil.memLongBuffer(pixelsPtr, words);
+        // 单趟完成两件事：与镜像找差异、顺带判定整帧是否全零。
+        boolean dirty = false;
+        boolean empty = true;
+        for (int i = 0; i < words; i++) {
+            long v = current.get(i);
+            if (v != 0L) {
+                empty = false;
+            }
+            if (!dirty && v != rasterShadow.get(i)) {
+                dirty = true;
+            }
+            if (dirty && !empty) {
+                break;  // 两个结论都出来了，剩下的不用看
+            }
+        }
+        if (!dirty && tail != 0) {
+            long mask = (1L << (tail << 3)) - 1L;
+            if ((org.lwjgl.system.MemoryUtil.memGetInt(pixelsPtr + ((long) words << 3)) & (int) mask) != 0) {
+                dirty = true;
+                empty = false;
+            }
+        }
+
+        if (empty && (dirty || lastUploadEmpty)) {
+            // 全透明帧：屏幕上本来就没有我们的内容，什么都不用提交。
+            lastUploadEmpty = true;
+            // 镜像同步成「全零」：memset 比逐字拷贝快。
+            org.lwjgl.system.MemoryUtil.memSet(
+                    org.lwjgl.system.MemoryUtil.memAddress(rasterShadow), 0, (long) words << 3);
+            return;
+        }
+        if (!dirty && !lastUploadEmpty) {
+            // 静态帧：纹理里还是上一帧的内容，只补 blit。
+            blitOverlayStratum(renderState, guiWidth, guiHeight);
+            return;
+        }
+
         ensureRasterUploadTarget();
         // NativeImage 与离屏像素是同一块内存：这里没有任何拷贝，只有一次纹理传输。
         RenderSystem.getDevice().createCommandEncoder().writeToTexture(rasterTexture, rasterPixels);
-        // 新开 stratum（绘制顺序 = strata 入列顺序）→ 整屏 blit 盖在所有 GUI 之上。
-        // pose 用单位阵：提交的就是 GUI 坐标，坐标换算由 GUI 管线的投影完成；
-        // uv 0..1 整张纹理；color=-1（白）不再染色。
+        org.lwjgl.system.MemoryUtil.memCopy(pixelsPtr,
+                org.lwjgl.system.MemoryUtil.memAddress(rasterShadow), (long) words << 3);
+        if (tail != 0) {
+            int tailInt = org.lwjgl.system.MemoryUtil.memGetInt(pixelsPtr + ((long) words << 3));
+            org.lwjgl.system.MemoryUtil.memPutInt(
+                    org.lwjgl.system.MemoryUtil.memAddress(rasterShadow) + ((long) words << 3), tailInt);
+        }
+        lastUploadEmpty = empty;
+        blitOverlayStratum(renderState, guiWidth, guiHeight);
+    }
+
+    /** 提交引用上传纹理的整屏 blit（stratum 顺序保证画在所有 GUI 之上）。 */
+    private static void blitOverlayStratum(GuiRenderState renderState, int guiWidth, int guiHeight) {
         renderState.nextStratum();
         renderState.submitBlitToCurrentLayer(new BlitRenderState(
                 RenderPipelines.GUI_TEXTURED_PREMULTIPLIED_ALPHA,
