@@ -214,6 +214,12 @@ public final class SkijaEffects {
         if (canvas == null || alpha <= 0.001f || width <= 0 || height <= 0 || sigma <= 0) {
             return;
         }
+        // VulkanMod 兼容：本渲染层在该模式下是 CPU 光栅，saveLayer+blur 会退化成对整块
+        // 区域的纯 CPU 模糊——2560x1600 实机每帧上百毫秒（公告界面掉帧的主因）。
+        // 玻璃层不画：底下已画的内容原样保留，观感退化为「无磨砂玻璃」，内容不丢。
+        if (VulkanBackend.isActive()) {
+            return;
+        }
         Rect bounds = Rect.makeXYWH((float) x, (float) y, (float) width, (float) height);
         int depth = canvas.save();
         try {
@@ -239,6 +245,10 @@ public final class SkijaEffects {
                                            double radius, float sigma, float alpha) {
         Canvas canvas = SkijaGfx.canvas();
         if (canvas == null || alpha <= 0.001f || width <= 0 || height <= 0 || sigma <= 0) {
+            return;
+        }
+        // VulkanMod 兼容：同 backdropBlur——CPU 光栅下模糊层是每帧大区域纯 CPU 计算，跳过。
+        if (VulkanBackend.isActive()) {
             return;
         }
         Rect bounds = Rect.makeXYWH((float) x, (float) y, (float) width, (float) height);
@@ -474,6 +484,13 @@ public final class SkijaEffects {
     public static void bloom(Runnable content) {
         Canvas canvas = SkijaGfx.canvas();
         if (canvas == null) {
+            content.run();
+            return;
+        }
+        // VulkanMod 兼容：bloom 的 saveLayer(null) 是全屏离屏层 + 全屏模糊，
+        // CPU 光栅下每帧就是一次 2560x1600 的纯 CPU box blur（首启欢迎实测掉到个位数帧）。
+        // 走「着色器编译失败」的同款降级：泛光没了，内容原样画。
+        if (VulkanBackend.isActive()) {
             content.run();
             return;
         }

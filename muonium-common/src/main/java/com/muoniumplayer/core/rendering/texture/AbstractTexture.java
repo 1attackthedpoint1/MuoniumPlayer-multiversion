@@ -29,6 +29,11 @@ public abstract class AbstractTexture implements ITextureObject, SharedConstants
             magFilter = GL11.GL_NEAREST;
         }
 
+        // VulkanMod：没有 GL 上下文，过滤参数无处置办（bindTexture 在该模式下是 no-op，
+        // 直接 glTexParameteri 打的是未绑定目标）。字段照常更新，GL 一律不碰。
+        if (com.muoniumplayer.render.skija.VulkanBackend.isActive()) {
+            return;
+        }
         this.bindTexture();
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, minFilter);
         GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, magFilter);
@@ -50,6 +55,12 @@ public abstract class AbstractTexture implements ITextureObject, SharedConstants
 
     public int getGlTextureId() {
         if (this.glTextureId == -1) {
+            // VulkanMod：没有 GL 上下文，glGenTextures 只能段错误。恒返回 -1——
+            // 下游全部自洽：bindTexture 对 -1 no-op、deleteTexture 对 -1 直接返回、
+            // SkijaImages.wrap 对 glId<=0 返回 null（调用方画占位色块）。
+            if (com.muoniumplayer.render.skija.VulkanBackend.isActive()) {
+                return -1;
+            }
             this.glTextureId = TextureUtil.glGenTextures();
         }
 

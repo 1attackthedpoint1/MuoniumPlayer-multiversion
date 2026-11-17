@@ -200,13 +200,9 @@ public final class SkijaHost {
     public static boolean vulkanRenderer() {
         if (!vulkanRendererDecided) {
             vulkanRendererDecided = true;
-            try {
-                Class.forName("net.vulkanmod.vulkan.Renderer", false,
-                        SkijaHost.class.getClassLoader());
-                vulkanRenderer = true;
-            } catch (Throwable t) {
-                vulkanRenderer = false;
-            }
+            // 探测逻辑与一次性日志在共享层的 VulkanBackend 里：muonium-common 的老 GL 路径
+            // （纹理系统、绘制效果）同样要问同一个问题，探测只做一份。
+            vulkanRenderer = VulkanBackend.isActive();
             if (vulkanRenderer) {
                 log("检测到 VulkanMod（无 GL 上下文），渲染层切换 CPU 光栅 + GUI 纹理合成路径");
             }

@@ -98,6 +98,13 @@ public class DynamicTexture extends AbstractTexture {
 
     public void allocateTextureImpl(int levels, int width, int height) {
 
+        // VulkanMod：这条链路在 2026-11-17 实机从客户端 tick 直达 glTexImage2D →
+        // EXCEPTION_ACCESS_VIOLATION（hs_err_pid）。该模式下没有 GL 上下文，传上去
+        // 也没法被 Skia 引用（wrap 需要 GL DirectContext），整条上传只可能崩溃不可能出图。
+        if (com.muoniumplayer.render.skija.VulkanBackend.isActive()) {
+            return;
+        }
+
         this.deleteTexture();
         this.bindTexture();
         // 真实纹理尺寸登记给 Skia，理由见 TextureUtil.allocateTextureImpl。
@@ -125,6 +132,15 @@ public class DynamicTexture extends AbstractTexture {
 
     @SneakyThrows
     public void updateDynamicTexture() {
+
+        // VulkanMod：没有 GL 上下文，上传链路只可能崩溃（见 allocateTextureImpl 的注释）。
+        // 放在主线程分派之前判：非主线程调用连 runOnMainThreadBlocking 的空跑都省掉。
+        // clearable 的释放语义照常执行——像素没必要因为画不出来就攒在内存里。
+        if (com.muoniumplayer.render.skija.VulkanBackend.isActive()) {
+            if (this.clearable)
+                this.dynamicTextureData = null;
+            return;
+        }
 
         if (!MuoniumPlayerExtension.isCallingFromMainThread()) {
             MultiThreadingUtil.runOnMainThreadBlocking(() -> {
